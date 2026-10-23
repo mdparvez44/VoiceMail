@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -6,6 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'services/voicemail_database.dart';
+import 'services/voicemail_player.dart';
+import 'services/voicemail_recorder.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -64,6 +67,17 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
   bool isLoadingMessages = false;
   String? inboxError;
 
+  final VoicemailRecorder _recorder = VoicemailRecorder();
+  final VoicemailPlayer _player = VoicemailPlayer();
+
+  bool isRecording = false;
+  String? recordingPath;
+  String? playingPath;
+
+  Duration recordingDuration = Duration.zero;
+  Stopwatch? _recordingStopwatch;
+  Timer? _recordingTimer;
+
   final modes = const [
     ('Sleeping', Icons.nightlight_round, 'Rest without interruptions'),
     ('Reading', Icons.menu_book_rounded, 'Enjoy some quiet time'),
@@ -84,6 +98,9 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     customMessageController.dispose();
+    _recordingTimer?.cancel();
+    _recorder.dispose();
+    _player.dispose();
     super.dispose();
   }
 
@@ -127,74 +144,100 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _addTestVoicemail() async {
-    final nameController = TextEditingController(text: 'Test Caller');
-    final phoneController = TextEditingController(text: 'Unknown number');
+  Future<void> _startVoicemailRecording() async {
+    if (isRecording) return;
 
-    final shouldSave = await showDialog<bool>(
+    try {
+      final path = await _recorder.startRecording();
+
+      if (!mounted) {
+        await _recorder.stopRecording();
+        return;
+      }
+
+      _recordingStopwatch = Stopwatch()..start();
+
+      setState(() {
+        recordingPath = path;
+        recordingDuration = Duration.zero;
+        isRecording = true;
+      });
+
+      _recordingTimer?.cancel();
+
+      _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted || !isRecording) return;
+
+        setState(() {
+          recordingDuration = _recordingStopwatch?.elapsed ?? Duration.zero;
+        });
+      });
+    } catch (e) {
+      debugPrint('Could not start recording: $e');
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not start recording: $e')));
+    }
+  }
+
+  Future<void> _stopAndSaveRecording() async {
+    if (!isRecording) return;
+
+    _recordingTimer?.cancel();
+    _recordingStopwatch?.stop();
+
+    final elapsed = _recordingStopwatch?.elapsed ?? Duration.zero;
+    final path = await _recorder.stopRecording();
+
+    if (!mounted) return;
+
+    setState(() {
+      isRecording = false;
+      recordingDuration = elapsed;
+      recordingPath = null;
+    });
+
+    if (path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No recording file was created.')),
+      );
+      return;
+    }
+
+    // The dialog owns its controllers. They are disposed when
+    // the dialog widget is removed from the widget tree.
+    final save = await showDialog<Map<String, String>>(
       context: context,
       builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: surface,
-          title: const Text('Add test message'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameController,
-                autofocus: true,
-                textCapitalization: TextCapitalization.words,
-                decoration: const InputDecoration(
-                  labelText: 'Caller name',
-                  hintText: 'e.g. Alex',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 14),
-              TextField(
-                controller: phoneController,
-                keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(
-                  labelText: 'Phone number',
-                  hintText: 'e.g. +91 98765 43210',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'This creates a test record only. It does not record audio.',
-                style: TextStyle(color: muted, fontSize: 12),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Save'),
-            ),
-          ],
+        return _SaveVoicemailDialog(
+          recordingLength: _formatElapsed(elapsed),
+          surfaceColor: surface,
+          mutedColor: muted,
         );
       },
     );
 
-    final callerName = nameController.text.trim();
-    final phoneNumber = phoneController.text.trim();
+    final callerName = save?['callerName']?.trim() ?? '';
+    final phoneNumber = save?['phoneNumber']?.trim() ?? '';
 
-    nameController.dispose();
-    phoneController.dispose();
+    if (save == null || callerName.isEmpty || phoneNumber.isEmpty) {
+      try {
+        await File(path).delete();
+      } catch (e) {
+        debugPrint('Could not remove discarded recording: $e');
+      }
 
-    if (shouldSave != true || !mounted) return;
+      if (save != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Enter both caller name and phone number.'),
+          ),
+        );
+      }
 
-    if (callerName.isEmpty || phoneNumber.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Enter both the caller name and phone number.'),
-        ),
-      );
       return;
     }
 
@@ -202,23 +245,65 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
       await VoicemailDatabase.instance.addVoicemail(
         callerName: callerName,
         phoneNumber: phoneNumber,
+        durationSeconds: elapsed.inSeconds,
+        recordingPath: path,
       );
 
       await _refreshVoicemails();
 
       if (!mounted) return;
 
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Test message saved.')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Recording saved to your message room.')),
+      );
     } catch (e) {
-      debugPrint('Could not save test voicemail: $e');
+      debugPrint('Could not save recording details: $e');
+
+      try {
+        await File(path).delete();
+      } catch (_) {}
 
       if (!mounted) return;
 
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not save the message.')),
+        const SnackBar(content: Text('Could not save the recording.')),
       );
+    }
+  }
+
+  String _formatElapsed(Duration duration) {
+    final minutes = duration.inMinutes.toString().padLeft(2, '0');
+    final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
+
+    return '$minutes:$seconds';
+  }
+
+  Future<void> _togglePlayback(String path) async {
+    try {
+      if (playingPath == path) {
+        await _player.stop();
+
+        if (mounted) {
+          setState(() => playingPath = null);
+        }
+        return;
+      }
+
+      await _player.play(path);
+
+      if (mounted) {
+        setState(() => playingPath = path);
+      }
+    } catch (e) {
+      debugPrint('Could not play recording: $e');
+
+      if (!mounted) return;
+
+      setState(() => playingPath = null);
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not play recording: $e')));
     }
   }
 
@@ -264,7 +349,27 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
     if (confirmed != true) return;
 
     try {
+      final message = voicemails.firstWhere(
+        (item) => item['id'] == id,
+        orElse: () => <String, Object?>{},
+      );
+
+      final audioPath = message['recordingPath'] as String?;
+
       await VoicemailDatabase.instance.deleteVoicemail(id);
+
+      if (audioPath != null && audioPath.isNotEmpty) {
+        try {
+          final audioFile = File(audioPath);
+
+          if (await audioFile.exists()) {
+            await audioFile.delete();
+          }
+        } catch (e) {
+          debugPrint('Could not delete audio file: $e');
+        }
+      }
+
       await _refreshVoicemails();
 
       if (!mounted) return;
@@ -692,16 +797,51 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
               ),
               const SizedBox(width: 12),
               FilledButton.icon(
-                onPressed: _addTestVoicemail,
-                icon: const Icon(Icons.add, size: 19),
-                label: const Text('Add test'),
+                onPressed: isRecording
+                    ? _stopAndSaveRecording
+                    : _startVoicemailRecording,
+                icon: Icon(
+                  isRecording ? Icons.stop_rounded : Icons.mic_rounded,
+                  size: 19,
+                ),
+                label: Text(isRecording ? 'Stop & Save' : 'Record'),
                 style: FilledButton.styleFrom(
-                  backgroundColor: gold,
+                  backgroundColor: isRecording ? Colors.redAccent : gold,
                   foregroundColor: background,
                 ),
               ),
             ],
           ),
+          if (isRecording) ...[
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: surface,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: Colors.redAccent.withValues(alpha: 0.6),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.fiber_manual_record,
+                    color: Colors.redAccent,
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(child: Text('Recording in progress...')),
+                  Text(
+                    _formatElapsed(recordingDuration),
+                    style: const TextStyle(
+                      color: gold,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
           const SizedBox(height: 24),
           if (isLoadingMessages && voicemails.isEmpty)
             const Padding(
@@ -803,6 +943,9 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
     final createdAt = message['createdAt'] as String?;
     final duration = message['durationSeconds'];
     final isRead = (message['isRead'] as int? ?? 0) == 1;
+    final audioPath = message['recordingPath'] as String?;
+    final hasRecording = audioPath != null && audioPath.isNotEmpty;
+    final isPlaying = audioPath != null && playingPath == audioPath;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -905,6 +1048,19 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
                   ),
                 ),
                 const SizedBox(width: 4),
+                if (hasRecording)
+                  IconButton(
+                    tooltip: isPlaying ? 'Stop playback' : 'Play recording',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => _togglePlayback(audioPath),
+                    icon: Icon(
+                      isPlaying
+                          ? Icons.stop_circle_outlined
+                          : Icons.play_circle_outline,
+                      color: gold,
+                      size: 23,
+                    ),
+                  ),
                 IconButton(
                   tooltip: 'Delete message',
                   visualDensity: VisualDensity.compact,
@@ -920,6 +1076,88 @@ class _ButlerHomeState extends State<ButlerHome> with WidgetsBindingObserver {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// A dedicated stateful widget for saving a voicemail.
+///
+/// The text controllers belong to this dialog and are disposed
+/// when this widget is removed from the widget tree.
+class _SaveVoicemailDialog extends StatefulWidget {
+  const _SaveVoicemailDialog({
+    required this.recordingLength,
+    required this.surfaceColor,
+    required this.mutedColor,
+  });
+
+  final String recordingLength;
+  final Color surfaceColor;
+  final Color mutedColor;
+
+  @override
+  State<_SaveVoicemailDialog> createState() => _SaveVoicemailDialogState();
+}
+
+class _SaveVoicemailDialogState extends State<_SaveVoicemailDialog> {
+  late final TextEditingController _nameController;
+  late final TextEditingController _phoneController;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameController = TextEditingController();
+    _phoneController = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _phoneController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: widget.surfaceColor,
+      title: const Text('Save voicemail'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Length: ${widget.recordingLength}'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _nameController,
+            decoration: const InputDecoration(
+              labelText: 'Caller name',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _phoneController,
+            decoration: const InputDecoration(
+              labelText: 'Phone number',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop({
+            'callerName': _nameController.text.trim(),
+            'phoneNumber': _phoneController.text.trim(),
+          }),
+          child: const Text('Save'),
+        ),
+      ],
     );
   }
 }
